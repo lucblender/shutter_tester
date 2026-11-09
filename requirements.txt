@@ -1,0 +1,2 @@
+customtkinter>=2.4.0
+pyserial>=3.5
