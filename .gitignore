@@ -4,3 +4,4 @@
 dist/
 
 build/
+desktop_app/__pycache__/
