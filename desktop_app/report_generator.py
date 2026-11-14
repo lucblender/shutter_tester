@@ -90,29 +90,35 @@ def create_curve_svg(curve_data: dict, width: int = 600, height: int = 200) -> s
     if len(points) < 2:
         return ""
 
-    # Find min/max for scaling
+    # Find min/max for scaling (matching main app logic)
     times = [p[0] for p in points]
     values = [p[1] for p in points]
+    all_values = values + [curve_data.get("thr", 0)]
 
     min_time = min(times)
     max_time = max(times)
-    min_val = min(values)
-    max_val = max(values)
+    min_value = min(all_values)
+    max_value = max(all_values)
 
     time_range = max_time - min_time if max_time > min_time else 1
-    val_range = max_val - min_val if max_val > min_val else 1
+    vmin = (min_value // 10) * 10
+    vmax = (max_value // 10 + 1) * 10
+    value_span = vmax - vmin if vmax > vmin else 1
 
     # Padding
     padding = 50
     plot_width = width - 2 * padding
     plot_height = height - 2 * padding
 
-    # Scale functions
+    # Scale functions (matching main app)
     def scale_x(t):
         return padding + (t - min_time) / time_range * plot_width
 
     def scale_y(v):
-        return height - padding - (v - min_val) / val_range * plot_height
+        return height - padding - (v - vmin) / value_span * plot_height
+
+    # Calculate grid step (matching main app logic)
+    step = next(st for st in (10, 20, 50, 100, 200, 500, 1000) if value_span / st <= 5)
 
     # Build SVG
     svg = f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">\n'
@@ -132,15 +138,15 @@ def create_curve_svg(curve_data: dict, width: int = 600, height: int = 200) -> s
     svg += f'  <line class="axis" x1="{padding}" y1="{padding}" '
     svg += f'x2="{padding}" y2="{height - padding}"/>\n'
 
-    # Grid lines (vertical)
+    # Grid lines (vertical) - evenly spaced
     for i in range(5):
         x = padding + (i / 4) * plot_width
         svg += f'  <line class="grid" x1="{x}" y1="{padding}" '
         svg += f'x2="{x}" y2="{height - padding}"/>\n'
 
-    # Grid lines (horizontal)
-    for i in range(5):
-        y = padding + (i / 4) * plot_height
+    # Grid lines (horizontal) - based on value steps
+    for v in range(vmin, vmax + 1, step):
+        y = scale_y(v)
         svg += f'  <line class="grid" x1="{padding}" y1="{y}" '
         svg += f'x2="{width - padding}" y2="{y}"/>\n'
 
@@ -151,11 +157,10 @@ def create_curve_svg(curve_data: dict, width: int = 600, height: int = 200) -> s
         time_val_ms = time_val_us / 1000
         svg += f'  <text class="axis-label" x="{x}" y="{height - padding + 15}" text-anchor="middle">{time_val_ms:.2f}</text>\n'
 
-    # Y-axis labels (value values)
-    for i in range(5):
-        y = padding + (i / 4) * plot_height
-        val_val = max_val - (i / 4) * val_range
-        svg += f'  <text class="axis-label" x="{padding - 10}" y="{y + 3}" text-anchor="end">{val_val:.0f}</text>\n'
+    # Y-axis labels (value values) - based on value steps
+    for v in range(vmin, vmax + 1, step):
+        y = scale_y(v)
+        svg += f'  <text class="axis-label" x="{padding - 10}" y="{y + 3}" text-anchor="end">{v:.0f}</text>\n'
 
     # Axis labels
     svg += f'  <text class="label" x="{width - padding + 5}" y="{height - padding + 5}">Time (ms)</text>\n'
