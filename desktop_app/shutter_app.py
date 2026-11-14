@@ -3,15 +3,19 @@
 Requires: pip install customtkinter pyserial
 Protocol: see PROTOCOL.md
 """
+import json
+import os
 import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 
 import customtkinter as ctk
 import serial
 import serial.tools.list_ports
+
+from report_generator import ReportGenerator
 
 BAUD = 115200
 SPEEDS = {"1/500": 500, "1/1000": 1000, "1/2000": 2000}
@@ -84,6 +88,11 @@ class App:
         self.selected = None
         self.current_curve = None
         self._appearance = ctk.get_appearance_mode()
+
+        # Report mode state
+        self.report_mode = False
+        self.report_config = None
+        self.report_data = None      # stores all report measurements
 
         self.build_ui()
         self.refresh_ports()
@@ -178,6 +187,17 @@ class App:
         self.settings_widgets = [self.mode_seg, self.thr_entry, self.thr_btn,
                                  self.speed_seg, self.curve_switch]
 
+        # Report button
+        button_row = ctk.CTkFrame(sc, fg_color="transparent")
+        button_row.pack(fill="x", padx=14, pady=(0, 12))
+        self.report_btn = ctk.CTkButton(button_row, text="Start Report", width=120,
+                                        fg_color=ACCENT,
+                                        command=self.open_report_config)
+        self.report_btn.pack(side="left")
+        
+        # Add report button to settings widgets so it disables when not connected
+        self.settings_widgets.append(self.report_btn)
+
         # footer (packed before the content so it stays at the bottom)
         self.footer = ctk.CTkLabel(self.root, text="", text_color=MUTED, anchor="w",
                                    font=ctk.CTkFont(size=12))
@@ -226,6 +246,44 @@ class App:
         self.lux_bar.set(0)
         self.lux_bar.pack(fill="x", padx=24, pady=(14, 30))
 
+        # report view
+        self.report_frame = ctk.CTkFrame(self.content, fg_color="transparent")
+        report_card = self.card(self.report_frame)
+        report_card.pack(fill="x", pady=(0, 8))
+        self.report_title = ctk.CTkLabel(report_card, text="", text_color=TEXT,
+                                        font=ctk.CTkFont(size=16, weight="bold"))
+        self.report_title.pack(pady=(14, 6))
+        self.report_instruction = ctk.CTkLabel(report_card, text="", text_color=MUTED,
+                                              font=ctk.CTkFont(size=13))
+        self.report_instruction.pack(pady=(0, 14))
+
+        report_result_card = self.card(self.report_frame)
+        report_result_card.pack(fill="x", pady=(0, 8))
+        self.report_result = ctk.CTkLabel(report_result_card, text="-", text_color=TEXT,
+                                         font=ctk.CTkFont(size=64, weight="bold"))
+        self.report_result.pack(pady=(14, 0))
+        self.report_result_detail = ctk.CTkLabel(report_result_card, text="", text_color=MUTED,
+                                                font=ctk.CTkFont(size=12))
+        self.report_result_detail.pack(pady=(0, 14))
+
+        report_buttons_card = self.card(self.report_frame)
+        report_buttons_card.pack(fill="x", pady=(0, 8))
+        button_frame = ctk.CTkFrame(report_buttons_card, fg_color="transparent")
+        button_frame.pack(fill="x", padx=14, pady=12)
+        self.report_store_btn = ctk.CTkButton(button_frame, text="Store", width=100,
+                                             fg_color="#22c55e",
+                                             command=self.report_store)
+        self.report_store_btn.pack(side="left", padx=4)
+        self.report_discard_btn = ctk.CTkButton(button_frame, text="Discard", width=100,
+                                               fg_color=RED,
+                                               command=self.report_discard)
+        self.report_discard_btn.pack(side="left", padx=4)
+        ctk.CTkLabel(button_frame, text="", fg_color="transparent").pack(side="left", expand=True)
+        self.report_end_btn = ctk.CTkButton(button_frame, text="Exit Report", width=100,
+                                           fg_color=ACCENT,
+                                           command=self.exit_report_mode)
+        self.report_end_btn.pack(side="right")
+
         self.show_mode_view()
         self.update_curve_ui()
         self.render_history()
@@ -233,8 +291,12 @@ class App:
     def show_mode_view(self):
         self.trigger_frame.pack_forget()
         self.lux_frame.pack_forget()
-        frame = self.trigger_frame if self.mode == "T" else self.lux_frame
-        frame.pack(fill="both", expand=True)
+        self.report_frame.pack_forget()
+        if self.report_mode:
+            self.report_frame.pack(fill="both", expand=True)
+        else:
+            frame = self.trigger_frame if self.mode == "T" else self.lux_frame
+            frame.pack(fill="both", expand=True)
 
     def update_curve_ui(self):
         on = bool(self.curve_var.get())
@@ -443,15 +505,20 @@ class App:
     def on_shutter(self, us: int):
         self.big_shutter.configure(text=format_shutter(us))
         self.big_detail.configure(text=f"{us / 1000:.2f} ms  ({us} µs)")
-        self.entries.insert(0, {
-            "stamp": time.strftime("%H:%M:%S"),
-            "speed": format_shutter(us),
-            "us": us,
-            "curve": None,           # the curve (if enabled) arrives next
-        })
-        del self.entries[HISTORY:]
-        self.selected = None
-        self.render_history()
+
+        if self.report_mode:
+            self.pending_measurement = [us, None]
+            self.update_report_ui()
+        else:
+            self.entries.insert(0, {
+                "stamp": time.strftime("%H:%M:%S"),
+                "speed": format_shutter(us),
+                "us": us,
+                "curve": None,
+            })
+            del self.entries[HISTORY:]
+            self.selected = None
+            self.render_history()
 
     def on_curve(self, n, trig_index, tokens):
         points = []
@@ -462,12 +529,17 @@ class App:
             return
         curve = {"points": points, "trig_index": trig_index,
                  "thr": self.applied_threshold}
-        if self.entries:
-            self.entries[0]["curve"] = curve   # belongs to the latest shutter
-        self.current_curve = curve
-        self.selected = None
-        self.render_history()
-        self.draw_curve()
+
+        if self.report_mode and self.pending_measurement:
+            self.pending_measurement[1] = curve
+            self.update_report_ui()
+        else:
+            if self.entries:
+                self.entries[0]["curve"] = curve
+            self.current_curve = curve
+            self.selected = None
+            self.render_history()
+            self.draw_curve()
 
     # ---------------------------------------------------------- history
     def render_history(self):
@@ -572,6 +644,170 @@ class App:
             c.create_oval(X(t) - 1.8, Y(v) - 1.8, X(t) + 1.8, Y(v) + 1.8,
                           fill=col(CURVE), outline="")
 
+    # --------------------------------------------------------- report mode
+    def open_report_config(self):
+        dialog = ReportConfigDialog(self.root, self)
+
+    def start_report_mode(self, config):
+        self.report_config = config
+        self.report_mode = True
+        self.report_data = {
+            "camera": config["camera_name"],
+            "lens": config["lens_name"],
+            "shutter_speeds": config["shutter_speeds"],
+            "repetitions": config["repetitions"],
+            "trigger_value": config["trigger_value"],
+            "min_speed": config["min_speed"],
+            "store_curve": config["store_curve"],
+            "measurements": {}
+        }
+        for speed in config["shutter_speeds"]:
+            self.report_data["measurements"][speed] = []
+
+        self.current_speed_idx = 0
+        self.current_repetition = 1
+        self.pending_measurement = None
+        self.report_finished_printed = False
+
+        self.update_report_ui()
+        self.show_mode_view()
+        self.update_settings_ui()
+
+    def exit_report_mode(self):
+        if messagebox.askyesno("Exit Report", "Are you sure you want to exit report mode? Progress will be lost."):
+            self.report_mode = False
+            self.report_config = None
+            self.report_end_btn.configure(text="Exit Report")
+            self.show_mode_view()
+            self.update_settings_ui()
+            self.update_report_ui()
+            self.set_state("connected")
+
+    def generate_report(self):
+        """Generate markdown report from collected data."""
+        if not self.report_data or not self.report_config:
+            return
+        
+        try:
+            export_folder = self.report_config.get("export_folder", os.getcwd())
+            generator = ReportGenerator(output_dir=export_folder)
+            filepath = generator.generate(self.report_data)
+            self.say(f"Report saved: {filepath}")
+            return filepath
+        except Exception as e:
+            self.say(f"Error generating report: {e}")
+            return None
+
+    def update_settings_ui(self):
+        in_report = self.report_mode
+        for w in self.settings_widgets:
+            w.configure(state="disabled" if in_report else ("normal" if self.state == "connected" else "disabled"))
+
+    def update_report_ui(self):
+        if not self.report_mode:
+            self.report_frame.pack_forget()
+            return
+
+        config = self.report_config
+        speeds = config["shutter_speeds"]
+        reps = config["repetitions"]
+
+        if self.current_speed_idx >= len(speeds):
+            self.report_title.configure(text="Reporting finished")
+            self.report_instruction.configure(text="All measurements completed")
+            self.report_result.configure(text="✓")
+            self.report_result_detail.configure(text="Report complete")
+            self.report_store_btn.pack_forget()
+            self.report_discard_btn.pack_forget()
+            self.report_end_btn.configure(text="Back to Normal Mode")
+            self.report_end_btn.pack(side="right")
+            
+            # Print report data to console once
+            if not self.report_finished_printed:
+                self.report_finished_printed = True
+                print("\n" + "="*60)
+                print("REPORT FINISHED - RAW DATA")
+                print("="*60)
+                print(f"\nCamera: {self.report_data['camera']}")
+                print(f"Lens: {self.report_data['lens']}")
+                print(f"Trigger Value: {self.report_data['trigger_value']}")
+                print(f"Min Speed: {self.report_data['min_speed']} µs")
+                print(f"Store Curve: {self.report_data['store_curve']}")
+                print(f"Shutter Speeds Tested: {self.report_data['shutter_speeds']}")
+                print(f"Repetitions per Speed: {self.report_data['repetitions']}")
+                print("\nMeasurements:")
+                print("-" * 60)
+                for speed in self.report_data['shutter_speeds']:
+                    measurements = self.report_data['measurements'][speed]
+                    print(f"\n{speed}:")
+                    for i, m in enumerate(measurements, 1):
+                        print(f"  Rep {i}:")
+                        print(f"    Duration: {m['us']} µs ({m['us']/1000:.2f} ms)")
+                        print(f"    Timestamp: {m['timestamp']}")
+                        if m['curve']:
+                            print(f"    Curve points: {len(m['curve']['points'])}")
+                            print(f"    Trigger index: {m['curve']['trig_index']}")
+                            print(f"    Threshold: {m['curve']['thr']}")
+                        else:
+                            print(f"    Curve: None")
+                print("\n" + "="*60)
+                print("Full Data Object:")
+                print("="*60)
+                print(json.dumps(self.report_data, indent=2, default=str))
+                print("="*60 + "\n")
+                
+                # Generate markdown report
+                self.generate_report()
+            return
+
+        current_speed = speeds[self.current_speed_idx]
+        self.report_title.configure(text=f"Reporting: {config['camera_name']} / {config['lens_name']}")
+        self.report_instruction.configure(
+            text=f"Set Shutter speed at {current_speed}, repetition {self.current_repetition}/{reps}"
+        )
+
+        if self.pending_measurement:
+            us, curve = self.pending_measurement
+            self.report_result.configure(text=format_shutter(us))
+            self.report_result_detail.configure(text=f"{us / 1000:.2f} ms  ({us} µs)")
+            self.report_store_btn.pack(side="left", padx=4)
+            self.report_discard_btn.pack(side="left", padx=4)
+            self.report_end_btn.pack_forget()
+        else:
+            self.report_result.configure(text="—")
+            self.report_result_detail.configure(text="Waiting for measurement…")
+            self.report_store_btn.pack_forget()
+            self.report_discard_btn.pack_forget()
+            self.report_end_btn.pack(side="right")
+
+    def report_store(self):
+        if not self.pending_measurement:
+            return
+
+        us, curve = self.pending_measurement
+        speed = self.report_config["shutter_speeds"][self.current_speed_idx]
+        self.report_data["measurements"][speed].append({
+            "us": us,
+            "curve": curve,
+            "timestamp": time.strftime("%H:%M:%S")
+        })
+
+        reps = self.report_config["repetitions"]
+        if self.current_repetition >= reps:
+            self.current_speed_idx += 1
+            self.current_repetition = 1
+        else:
+            self.current_repetition += 1
+
+        self.pending_measurement = None
+        self.update_report_ui()
+        self.say(f"Measurement stored")
+
+    def report_discard(self):
+        self.pending_measurement = None
+        self.update_report_ui()
+        self.say("Measurement discarded")
+
     # --------------------------------------------------------- commands
     def on_mode(self, label):
         self.mode = MODE_CODES[label]
@@ -602,6 +838,200 @@ class App:
 
     def on_expected(self, label):
         self.send(f"EXP {EXPECTED[label]}")
+
+
+class ReportConfigDialog:
+    def __init__(self, parent, app):
+        self.app = app
+        self.shutter_speeds = []
+        self.selected_speed_var = tk.StringVar(value="1/500")
+        self.export_folder = tk.StringVar(value=os.getcwd())
+
+        self.dialog = ctk.CTkToplevel(parent)
+        self.dialog.title("Report Configuration")
+        self.dialog.geometry("500x750")
+        self.dialog.resizable(False, False)
+
+        main_frame = ctk.CTkScrollableFrame(self.dialog, fg_color=BG)
+        main_frame.pack(fill="both", expand=True, padx=16, pady=16)
+
+        # Camera name
+        ctk.CTkLabel(main_frame, text="Camera name", text_color=MUTED,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0, 4))
+        self.camera_entry = ctk.CTkEntry(main_frame, placeholder_text="e.g., Canon EOS 5D")
+        self.camera_entry.pack(fill="x", pady=(0, 12))
+
+        # Lens name
+        ctk.CTkLabel(main_frame, text="Lens name", text_color=MUTED,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0, 4))
+        self.lens_entry = ctk.CTkEntry(main_frame, placeholder_text="e.g., 50mm f/1.8")
+        self.lens_entry.pack(fill="x", pady=(0, 12))
+
+        # Shutter speeds
+        ctk.CTkLabel(main_frame, text="Shutter speeds", text_color=MUTED,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0, 4))
+        speed_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        speed_frame.pack(fill="x", pady=(0, 4))
+        self.speed_menu = ctk.CTkOptionMenu(speed_frame, values=list(EXPECTED), width=120,
+                                            variable=self.selected_speed_var,
+                                            command=lambda x: None)
+        self.speed_menu.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(speed_frame, text="Add", width=60,
+                      command=self.add_shutter_speed).pack(side="left")
+
+        # Custom speed
+        custom_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        custom_frame.pack(fill="x", pady=(0, 12))
+        ctk.CTkLabel(custom_frame, text="Custom:", text_color=MUTED, width=60).pack(side="left")
+        self.custom_speed_entry = ctk.CTkEntry(custom_frame, placeholder_text="1/n", width=100)
+        self.custom_speed_entry.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(custom_frame, text="Add", width=60,
+                      command=self.add_custom_speed).pack(side="left")
+
+        # Speed list
+        ctk.CTkLabel(main_frame, text="Speeds to test (slowest to fastest):", text_color=MUTED,
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(0, 4))
+        self.speed_list_frame = ctk.CTkFrame(main_frame, fg_color=CARD, corner_radius=8)
+        self.speed_list_frame.pack(fill="both", expand=True, pady=(0, 12))
+        self.speed_list_box = ctk.CTkScrollableFrame(self.speed_list_frame, fg_color="transparent",
+                                                     height=100)
+        self.speed_list_box.pack(fill="both", expand=True, padx=8, pady=8)
+        self.update_speed_list()
+
+        # Repetitions
+        ctk.CTkLabel(main_frame, text="Repetition number", text_color=MUTED,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0, 4))
+        self.repetitions_menu = ctk.CTkOptionMenu(main_frame, values=["2", "5", "10"],
+                                                  width=120)
+        self.repetitions_menu.set("5")
+        self.repetitions_menu.pack(fill="x", pady=(0, 12))
+
+        # Trigger value
+        ctk.CTkLabel(main_frame, text="Trigger value", text_color=MUTED,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0, 4))
+        thr_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        thr_frame.pack(fill="x", pady=(0, 12))
+        self.trigger_entry = ctk.CTkEntry(thr_frame, width=100)
+        self.trigger_entry.insert(0, self.app.applied_threshold)
+        self.trigger_entry.pack(side="left")
+        ctk.CTkLabel(thr_frame, text="(1-1023)", text_color=MUTED).pack(side="left", padx=(8, 0))
+
+        # Min speed
+        ctk.CTkLabel(main_frame, text="Fastest speed", text_color=MUTED,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0, 4))
+        self.min_speed_menu = ctk.CTkOptionMenu(main_frame, values=list(SPEEDS), width=120)
+        self.min_speed_menu.set("1/1000")
+        self.min_speed_menu.pack(fill="x", pady=(0, 12))
+
+        # Store curve
+        ctk.CTkLabel(main_frame, text="Store curve", text_color=MUTED,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0, 4))
+        self.store_curve_var = tk.IntVar(value=0)
+        ctk.CTkSwitch(main_frame, text="Store curve for each speed (last repetition only)",
+                      variable=self.store_curve_var, width=46).pack(anchor="w", pady=(0, 12))
+
+        # Export folder
+        ctk.CTkLabel(main_frame, text="Export folder", text_color=MUTED,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0, 4))
+        folder_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        folder_frame.pack(fill="x", pady=(0, 20))
+        self.folder_label = ctk.CTkLabel(folder_frame, text=self.export_folder.get(), 
+                                         text_color=TEXT, anchor="w")
+        self.folder_label.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        ctk.CTkButton(folder_frame, text="Browse", width=80,
+                      command=self.browse_folder).pack(side="right")
+
+        # Buttons
+        button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        button_frame.pack(fill="x")
+        ctk.CTkButton(button_frame, text="Cancel", width=100, fg_color=GRID,
+                      command=self.dialog.destroy).pack(side="left", padx=4)
+        ctk.CTkButton(button_frame, text="Start Reporting", width=120, fg_color=ACCENT,
+                      command=self.start_reporting).pack(side="right", padx=4)
+
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+    def add_shutter_speed(self):
+        speed = self.selected_speed_var.get()
+        if speed not in self.shutter_speeds:
+            self.shutter_speeds.append(speed)
+            self.sort_speeds()
+            self.update_speed_list()
+
+    def add_custom_speed(self):
+        text = self.custom_speed_entry.get().strip()
+        if not text:
+            messagebox.showwarning("Invalid input", "Please enter a custom speed")
+            return
+        if text not in self.shutter_speeds:
+            self.shutter_speeds.append(text)
+            self.sort_speeds()
+            self.update_speed_list()
+            self.custom_speed_entry.delete(0, tk.END)
+
+    def sort_speeds(self):
+        def speed_key(s):
+            try:
+                if "/" in s:
+                    return float(s.split("/")[1])
+                return float("inf")
+            except:
+                return float("inf")
+        self.shutter_speeds.sort(key=speed_key, reverse=False)
+
+    def update_speed_list(self):
+        for widget in self.speed_list_box.winfo_children():
+            widget.destroy()
+
+        if not self.shutter_speeds:
+            lbl = ctk.CTkLabel(self.speed_list_box, text="No speeds added yet", text_color=MUTED)
+            lbl.pack(pady=20)
+            return
+
+        for speed in self.shutter_speeds:
+            frame = ctk.CTkFrame(self.speed_list_box, fg_color="transparent")
+            frame.pack(fill="x", padx=4, pady=2)
+            ctk.CTkLabel(frame, text=speed, text_color=TEXT, width=100).pack(side="left")
+            ctk.CTkButton(frame, text="✕", width=30, fg_color=RED,
+                          command=lambda s=speed: self.remove_speed(s)).pack(side="right")
+
+    def remove_speed(self, speed):
+        self.shutter_speeds.remove(speed)
+        self.update_speed_list()
+
+    def browse_folder(self):
+        folder = filedialog.askdirectory(title="Select export folder")
+        if folder:
+            self.export_folder.set(folder)
+            self.folder_label.configure(text=folder)
+
+    def start_reporting(self):
+        if not self.shutter_speeds:
+            messagebox.showwarning("Invalid config", "Please add at least one shutter speed")
+            return
+
+        try:
+            trigger = int(self.trigger_entry.get())
+            if not 1 <= trigger <= 1023:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid trigger", "Trigger value must be 1-1023")
+            return
+
+        config = {
+            "camera_name": self.camera_entry.get() or "Unknown",
+            "lens_name": self.lens_entry.get() or "Unknown",
+            "shutter_speeds": self.shutter_speeds,
+            "repetitions": int(self.repetitions_menu.get()),
+            "trigger_value": trigger,
+            "min_speed": SPEEDS[self.min_speed_menu.get()],
+            "store_curve": bool(self.store_curve_var.get()),
+            "export_folder": self.export_folder.get(),
+        }
+
+        self.dialog.destroy()
+        self.app.start_report_mode(config)
 
 
 if __name__ == "__main__":
