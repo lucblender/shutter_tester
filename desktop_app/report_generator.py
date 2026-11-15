@@ -16,15 +16,7 @@ def us_to_shutter_fraction(us: int) -> str:
     try:
         # Round to nearest common shutter speed denominator
         fraction = 1_000_000 / us
-
-        # Common denominators
-        common = [15, 20, 25, 30, 40, 50, 60, 80, 100, 125, 160, 200, 250,
-                  320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500,
-                  3200, 4000, 5000, 6400, 8000]
-
-        # Find closest common denominator
-        closest = min(common, key=lambda x: abs(x - fraction))
-        return f"1/{closest}"
+        return f"1/{fraction:.2f}"
     except (ValueError, ZeroDivisionError):
         return "N/A"
 
@@ -53,6 +45,37 @@ def format_duration(us: int) -> str:
         return "N/A"
 
 
+def format_duration_std_dev(us: int) -> str:
+    """Format duration as time in engineering format.
+
+    Example: 12696 us (12.70 ms)
+    """
+    try:
+
+        # Convert to appropriate unit with engineering format
+        if us >= 1_000_000:
+            # seconds
+            seconds = us / 1_000_000
+            return f"{seconds:.2f} s"
+        elif us >= 1_000:
+            # milliseconds
+            ms = us / 1_000
+            return f"{ms:.2f} ms"
+        else:
+            # microseconds
+            return f"{us:.0f} µs"
+    except (ValueError, ZeroDivisionError):
+        return "N/A"
+
+
+def format_coefficient_variation(cv_percent: float) -> str:
+    """Format coefficient of variation as percentage."""
+    try:
+        return f"{cv_percent:.2f}%"
+    except (ValueError, ZeroDivisionError):
+        return "N/A"
+
+
 def calculate_statistics(measurements: list) -> dict:
     """Calculate average, median, and error for a list of measurements."""
     if not measurements:
@@ -60,6 +83,7 @@ def calculate_statistics(measurements: list) -> dict:
             "average": 0,
             "median": 0,
             "stddev": 0,
+            "cv_percent": 0,
             "min": 0,
             "max": 0,
             "count": 0
@@ -70,11 +94,13 @@ def calculate_statistics(measurements: list) -> dict:
     average = statistics.mean(values) if count > 0 else 0
     median = statistics.median(values) if count > 0 else 0
     stddev = statistics.stdev(values) if count > 1 else 0
+    cv_percent = (stddev / average * 100) if average > 0 else 0
 
     return {
         "average": average,
         "median": median,
         "stddev": stddev,
+        "cv_percent": cv_percent,
         "min": min(values) if values else 0,
         "max": max(values) if values else 0,
         "count": count
@@ -118,7 +144,8 @@ def create_curve_svg(curve_data: dict, width: int = 600, height: int = 200) -> s
         return height - padding - (v - vmin) / value_span * plot_height
 
     # Calculate grid step (matching main app logic)
-    step = next(st for st in (10, 20, 50, 100, 200, 500, 1000) if value_span / st <= 5)
+    step = next(st for st in (10, 20, 50, 100, 200,
+                500, 1000) if value_span / st <= 5)
 
     # Build SVG
     svg = f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">\n'
@@ -248,11 +275,11 @@ class ReportGenerator:
             Path to generated report file
         """
         self.timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
+
         # Sanitize camera and lens names for filename
         camera_name = sanitize_filename(report_data.get('camera', 'Unknown'))
         lens_name = sanitize_filename(report_data.get('lens', 'Unknown'))
-        
+
         filename = f"report_{camera_name}_{lens_name}_{self.timestamp}.md"
         filepath = os.path.join(self.output_dir, filename)
 
@@ -275,7 +302,8 @@ class ReportGenerator:
         # Header
         camera_name = report_data.get('camera', 'Unknown')
         lens_name = report_data.get('lens', 'Unknown')
-        lines.append(f"# {camera_name} - {lens_name} - Shutter Speed Test Report\n")
+        lines.append(
+            f"# {camera_name} - {lens_name} - Shutter Speed Test Report\n")
         lines.append(
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
@@ -299,24 +327,25 @@ class ReportGenerator:
 
         # Summary table
         lines.append(
-            "| Shutter Speed | Count | Average | Median | Std Dev | Min | Max |")
-        lines.append("|---|---|---|---|---|---|---|")
+            "| Shutter Speed | Count | Average | Median | Std Dev | CV | Min | Max |")
+        lines.append("|---|---|---|---|---|---|---|---|")
 
         for speed in shutter_speeds:
             meas = measurements.get(speed, [])
             stats = calculate_statistics(meas)
 
             if stats["count"] == 0:
-                lines.append(f"| {speed} | 0 | — | — | — | — | — |")
+                lines.append(f"| {speed} | 0 | — | — | — | — | — | — |")
             else:
                 avg_str = format_duration(stats['average'])
                 med_str = format_duration(stats['median'])
-                std_str = format_duration(stats['stddev'])
+                std_str = format_duration_std_dev(stats['stddev'])
+                cv_str = format_coefficient_variation(stats['cv_percent'])
                 min_str = format_duration(stats['min'])
                 max_str = format_duration(stats['max'])
 
                 lines.append(
-                    f"| {speed} | {stats['count']} | {avg_str} | {med_str} | {std_str} | {min_str} | {max_str} |")
+                    f"| {speed} | {stats['count']} | {avg_str} | {med_str} | {std_str} | {cv_str} | {min_str} | {max_str} |")
 
         lines.append("")
 
@@ -337,7 +366,9 @@ class ReportGenerator:
             lines.append(
                 f"- Measured Median: {format_duration(stats['median'])}")
             lines.append(
-                f"- Standard Deviation: {format_duration(stats['stddev'])}")
+                f"- Standard Deviation: {format_duration_std_dev(stats['stddev'])}")
+            lines.append(
+                f"- Coefficient of Variation: {format_coefficient_variation(stats['cv_percent'])}")
             lines.append(
                 f"- Range: {format_duration(stats['min'])} – {format_duration(stats['max'])}")
             lines.append(f"- Repetitions: {stats['count']}\n")
@@ -373,7 +404,8 @@ class ReportGenerator:
                             assets_folder = os.path.basename(self.assets_dir)
                             rel_path = f"{assets_folder}/{svg_filename}"
                             lines.append(f"**Last shutter curve:**\n")
-                            lines.append(f"![Last shutter curve]({rel_path})\n")
+                            lines.append(
+                                f"![Last shutter curve]({rel_path})\n")
                             lines.append("")
 
         return "\n".join(lines)

@@ -5,3 +5,6 @@ dist/
 
 build/
 desktop_app/__pycache__/
+
+report*/
+report*.md

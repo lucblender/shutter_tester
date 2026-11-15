@@ -2,7 +2,7 @@
 
 This project contains:
 
-- a Windows desktop app for testing shutter timing
+- a Windows desktop app for testing shutter timing with report generation
 - a Pico firmware project for the shutter tester device
 - the serial protocol documentation used by the app and device
 
@@ -23,7 +23,7 @@ This project contains:
 python -m pip install -r requirements.txt
 ```
 
-3. Run the app directly:
+1. Run the app directly:
 
 ```bash
 python desktop_app\shutter_app.py

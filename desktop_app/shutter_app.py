@@ -619,22 +619,26 @@ class App:
         pts = curve["points"]
         t0, t1 = pts[0][0], pts[-1][0]
         span = max(t1 - t0, 1)
-        # y axis: 0 to the next multiple of 10 above the highest value
+        # y axis: from previous multiple of 10 below lowest value to next multiple of 10 above highest value
         # (the trigger line is included so it always stays visible)
-        top_value = max(max(v for _, v in pts), curve["thr"])
-        vmax = (top_value // 10 + 1) * 10
+        all_values = [v for _, v in pts] + [curve["thr"]]
+        min_value = min(all_values)
+        max_value = max(all_values)
+        vmin = (min_value // 10) * 10
+        vmax = (max_value // 10 + 1) * 10
+        value_span = vmax - vmin if vmax > vmin else 1
         # grid step: smallest "nice" step giving at most 5 lines
         step = next(st for st in (10, 20, 50, 100,
-                    200, 500, 1000) if vmax / st <= 5)
+                    200, 500, 1000) if value_span / st <= 5)
 
         def X(t):
             return left + (t - t0) / span * pw
 
         def Y(v):
-            return top + ph - v / vmax * ph
+            return top + ph - (v - vmin) / value_span * ph
 
         # grid and labels
-        for v in range(0, vmax + 1, step):
+        for v in range(vmin, vmax + 1, step):
             c.create_line(left, Y(v), left + pw, Y(v), fill=col(GRID))
             c.create_text(left - 5, Y(v), text=str(v),
                           anchor="e", fill=col(MUTED), font=small)
@@ -722,9 +726,13 @@ class App:
         self.pending_curve_index = None
         self.pending_last_curve = False
         self.report_finished_printed = False
+        self._last_speed_idx = None
+        self._last_trigger_value = None
 
         # Initialize report mode settings
         self.send("MODE T")
+        self.send(f"THR {config['trigger_value']}")
+        self.send(f"MIN {config['min_speed']}")
         self.send("CURVE 0")
 
         self.update_report_ui()
@@ -842,17 +850,19 @@ class App:
         self.report_title.configure(
             text=f"Reporting: {config['camera_name']} / {config['lens_name']}")
 
-        # Check if we've switched to a new speed and make it bold
-        if not hasattr(self, '_last_speed_idx'):
-            self._last_speed_idx = self.current_speed_idx
-
         speed_changed = self.current_speed_idx != self._last_speed_idx
+        trigger_changed = config["trigger_value"] != self._last_trigger_value
         self._last_speed_idx = self.current_speed_idx
+        self._last_trigger_value = config["trigger_value"]
 
-        instruction_text = f"Set Shutter speed at {current_speed}\nRepetition {self.current_repetition}/{reps}"
+        instruction_text = (
+            f"Set Trigger value at {config['trigger_value']}\n"
+            f"Set Shutter speed at {current_speed}\n"
+            f"Repetition {self.current_repetition}/{reps}"
+        )
         self.report_instruction.configure(text=instruction_text)
 
-        if speed_changed:
+        if speed_changed or trigger_changed:
             self.report_instruction.configure(
                 text_color="#22c55e"
             )
